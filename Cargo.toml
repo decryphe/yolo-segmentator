@@ -1,0 +1,30 @@
+[package]
+name = "yolo-segmentator"
+version = "0.1.0"
+authors = ["decryphe"]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+eframe = { version="*", default-features = false, features = [
+  "default",
+  "__screenshot", # __screenshot is so we can dump a screenshot using EFRAME_SCREENSHOT_TO
+] }
+egui_extras = { version="*", default-features = false, features = ["default", "image"] }
+env_logger = { version="*", default-features = false, features = ["auto-color", "humantime"] }
+image = { version="*", default-features = false, features = ["jpeg", "png"] }
+rfd = { version = "*", default-features = true }
+serde = { version = "*", features = ["derive"], default-features = false }
+serde_yaml_ng = "*"
+futures = { version = "*", default-features = false, features = ["std", "executor", "async-await"] }
+notify = { version = "*" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+missing_errors_doc = "allow"
