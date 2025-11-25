@@ -1,8 +1,8 @@
+use crate::watcher::{self, DatasetWatcher as FsWatcher};
 use futures::channel::{mpsc, oneshot};
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_yaml_ng as serde_yaml;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -52,6 +52,13 @@ impl SegmentEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageSplit {
+    Train,
+    Val,
+    Test,
+}
+
 #[derive(Clone, Default)]
 pub struct DatasetImages {
     pub train: Vec<ImageEntry>,
@@ -59,8 +66,25 @@ pub struct DatasetImages {
     pub test: Vec<ImageEntry>,
 }
 
+impl DatasetImages {
+    pub fn from_entries(entries: Vec<ImageEntry>) -> Self {
+        let mut train = Vec::new();
+        let mut val = Vec::new();
+        let mut test = Vec::new();
+        for entry in entries {
+            match entry.split {
+                ImageSplit::Train => train.push(entry),
+                ImageSplit::Val => val.push(entry),
+                ImageSplit::Test => test.push(entry),
+            }
+        }
+        Self { train, val, test }
+    }
+}
+
 #[derive(Clone)]
 pub struct ImageEntry {
+    pub split: ImageSplit,
     pub path: String,
     pub has_labels: bool,
 }
@@ -161,7 +185,8 @@ impl Dataset {
     }
 
     pub fn refresh_image_lists(&mut self) {
-        self.images = Self::gather_images(&self.root);
+        let entries = watcher::gather_images(&self.root.join("images"));
+        self.images = DatasetImages::from_entries(entries);
     }
 
     pub fn load_segments_for_image(&mut self, image_path: &Path) -> Result<usize, String> {
@@ -212,46 +237,6 @@ impl Dataset {
         Ok(self.segments.len())
     }
 
-    fn gather_images(root: &Path) -> DatasetImages {
-        DatasetImages {
-            train: Self::collect_images(&root.join("images/train")),
-            val: Self::collect_images(&root.join("images/val")),
-            test: Self::collect_images(&root.join("images/test")),
-        }
-    }
-
-    fn collect_images(dir: &Path) -> Vec<ImageEntry> {
-        let mut files = Vec::new();
-        if !dir.exists() {
-            return files;
-        }
-        let mut queue = VecDeque::from([dir.to_path_buf()]);
-        while let Some(path) = queue.pop_front() {
-            let Ok(read_dir) = std::fs::read_dir(&path) else {
-                continue;
-            };
-            for entry in read_dir.flatten() {
-                let entry_path = entry.path();
-                if entry_path.is_dir() {
-                    queue.push_back(entry_path);
-                } else if is_supported_image(&entry_path) {
-                    let rel = entry_path
-                        .strip_prefix(dir)
-                        .unwrap_or(&entry_path)
-                        .display()
-                        .to_string();
-                    let has_labels = entry_path.with_extension("txt").exists();
-                    files.push(ImageEntry {
-                        path: rel,
-                        has_labels,
-                    });
-                }
-            }
-        }
-        files.sort_by(|a, b| a.path.cmp(&b.path));
-        files
-    }
-
     pub fn flattened_image_paths(&self) -> Vec<PathBuf> {
         let mut result = Vec::new();
         for (split, entries) in [
@@ -267,117 +252,6 @@ impl Dataset {
     }
 }
 
-fn is_supported_image(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png"))
-}
-
-impl DatasetWatcher {
-    fn new(dataset: Arc<RwLock<Option<Dataset>>>) -> Self {
-        Self {
-            dataset,
-            watcher: None,
-            event_rx: None,
-        }
-    }
-
-    fn rebuild(&mut self) {
-        match self.configure_dataset_watcher() {
-            Ok((watcher, rx)) => {
-                println!("Watching dataset images for changes");
-                self.watcher = Some(watcher);
-                self.event_rx = Some(rx);
-                if let Err(err) = self.refresh_dataset_images() {
-                    eprintln!("Failed to refresh dataset images: {err}");
-                }
-            }
-            Err(err) => {
-                if let Some(err) = err {
-                    eprintln!("Unable to configure watcher: {err}");
-                }
-                self.watcher = None;
-                self.event_rx = None;
-            }
-        }
-    }
-
-    fn configure_dataset_watcher(
-        &self,
-    ) -> Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>), Option<String>> {
-        let path = {
-            let guard = self
-                .dataset
-                .read()
-                .map_err(|_| Some("Dataset lock poisoned".to_owned()))?;
-            let Some(ds) = guard.as_ref() else {
-                return Err(None);
-            };
-            if let Err(err) = ds.ensure_directories() {
-                eprintln!("Failed to ensure dataset directories: {err}");
-            }
-            ds.root.join("images")
-        };
-
-        Self::create_async_watcher(&path).map_err(|err| Some(err.to_string()))
-    }
-
-    fn create_async_watcher(
-        path: &Path,
-    ) -> notify::Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)> {
-        if !path.exists()
-            && let Err(err) = std::fs::create_dir_all(path)
-        {
-            eprintln!("Failed to create directory {}: {err}", path.display());
-        }
-        let (mut tx, rx) = mpsc::channel(128);
-        let mut watcher = RecommendedWatcher::new(
-            move |res| {
-                futures::executor::block_on(async {
-                    use futures::SinkExt;
-                    let _ = tx.send(res).await;
-                });
-            },
-            Config::default(),
-        )?;
-        watcher.watch(path, RecursiveMode::Recursive)?;
-        println!("Configured watcher on {}", path.display());
-        Ok((watcher, rx))
-    }
-
-    async fn event(&mut self) -> Option<notify::Result<Event>> {
-        use futures::StreamExt;
-
-        if let Some(stream) = self.event_rx.as_mut() {
-            stream.next().await
-        } else {
-            futures::future::pending().await
-        }
-    }
-
-    fn refresh_dataset_images(&self) -> Result<(), String> {
-        let root = {
-            let guard = self
-                .dataset
-                .read()
-                .map_err(|_| "Dataset lock poisoned".to_owned())?;
-            match guard.as_ref() {
-                Some(dataset) => dataset.root.clone(),
-                None => return Ok(()),
-            }
-        };
-        let images = Dataset::gather_images(&root);
-        let mut guard = self
-            .dataset
-            .write()
-            .map_err(|_| "Dataset lock poisoned".to_owned())?;
-        if let Some(dataset) = guard.as_mut() {
-            dataset.images = images;
-        }
-        Ok(())
-    }
-}
-
 async fn worker_loop(
     dataset: Arc<RwLock<Option<Dataset>>>,
     change_rx: mpsc::UnboundedReceiver<()>,
@@ -388,7 +262,8 @@ async fn worker_loop(
 
     let mut change_rx = change_rx.fuse();
     let mut shutdown_rx = shutdown_rx.fuse();
-    let mut watcher = DatasetWatcher::new(dataset);
+    let (image_tx, mut image_rx) = mpsc::unbounded();
+    let mut watcher: Option<FsWatcher> = None;
 
     loop {
         futures::select! {
@@ -396,27 +271,46 @@ async fn worker_loop(
                 if change.is_none() {
                     break;
                 }
-                watcher.rebuild();
+                watcher = configure_dataset_watcher(&dataset, image_tx.clone());
                 ctx.request_repaint();
+            }
+            entries = image_rx.next() => {
+                match entries {
+                    Some(images) => {
+                        if let Err(err) = update_dataset_images(&dataset, images) {
+                            eprintln!("Failed to update dataset images: {err}");
+                        }
+                        ctx.request_repaint();
+                    }
+                    None => break,
+                }
             }
             _ = shutdown_rx => {
                 break;
             }
-            event = watcher.event().fuse() => {
+            event = async {
+                if let Some(watcher) = watcher.as_mut() {
+                    watcher.event().await
+                } else {
+                    futures::future::pending().await
+                }
+            }.fuse() => {
                 match event {
                     Some(Ok(event)) => {
-                        if matches_event(&event) {
+                        if watcher::matches_event(&event) {
                             println!("Filesystem event: {event:?}");
-                            if let Err(err) = watcher.refresh_dataset_images() {
+                            if let Some(err) = watcher
+                                .as_ref()
+                                .and_then(|active| active.send_image_snapshot().err())
+                            {
                                 eprintln!("Failed to refresh dataset images: {err}");
                             }
-                            ctx.request_repaint();
                         }
                     }
                     Some(Err(err)) => eprintln!("Filesystem watch error: {err}"),
                     None => {
                         println!("Filesystem watcher channel closed; rebuilding");
-                        watcher.rebuild();
+                        watcher = configure_dataset_watcher(&dataset, image_tx.clone());
                     }
                 }
             }
@@ -424,20 +318,42 @@ async fn worker_loop(
     }
 }
 
-fn matches_event(event: &Event) -> bool {
-    use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind};
-    match &event.kind {
-        EventKind::Create(kind) => matches!(
-            kind,
-            CreateKind::Any | CreateKind::File | CreateKind::Folder
-        ),
-        EventKind::Modify(kind) => matches!(kind, ModifyKind::Data(_) | ModifyKind::Name(_)),
-        EventKind::Remove(kind) => matches!(
-            kind,
-            RemoveKind::Any | RemoveKind::File | RemoveKind::Folder
-        ),
-        _ => false,
+fn configure_dataset_watcher(
+    dataset: &Arc<RwLock<Option<Dataset>>>,
+    images_tx: mpsc::UnboundedSender<Vec<ImageEntry>>,
+) -> Option<FsWatcher> {
+    let images_dir = {
+        let guard = dataset.read().ok()?;
+        let ds = guard.as_ref()?;
+        if let Err(err) = ds.ensure_directories() {
+            eprintln!("Failed to ensure dataset directories: {err}");
+        }
+        ds.root.join("images")
+    };
+
+    let mut watcher = FsWatcher::new(images_dir, images_tx);
+    match watcher.rebuild() {
+        Ok(()) => Some(watcher),
+        Err(err) => {
+            if let Some(err) = err {
+                eprintln!("Unable to configure watcher: {err}");
+            }
+            None
+        }
     }
+}
+
+fn update_dataset_images(
+    dataset: &Arc<RwLock<Option<Dataset>>>,
+    entries: Vec<ImageEntry>,
+) -> Result<(), String> {
+    let mut guard = dataset
+        .write()
+        .map_err(|_| "Dataset lock poisoned".to_owned())?;
+    if let Some(ds) = guard.as_mut() {
+        ds.images = DatasetImages::from_entries(entries);
+    }
+    Ok(())
 }
 
 impl Drop for DirectoryWatcher {
@@ -476,12 +392,6 @@ pub struct DirectoryWatcher {
     change_tx: mpsc::UnboundedSender<()>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     handle: Option<std::thread::JoinHandle<()>>,
-}
-
-pub struct DatasetWatcher {
-    dataset: Arc<RwLock<Option<Dataset>>>,
-    watcher: Option<RecommendedWatcher>,
-    event_rx: Option<mpsc::Receiver<notify::Result<Event>>>,
 }
 
 impl DirectoryWatcher {

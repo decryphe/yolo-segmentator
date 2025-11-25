@@ -2,6 +2,7 @@
 #![allow(rustdoc::missing_crate_level_docs)] // it's an example
 
 mod dataset;
+mod watcher;
 
 use eframe::egui;
 use rfd::FileDialog;
