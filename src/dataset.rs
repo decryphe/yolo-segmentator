@@ -52,13 +52,6 @@ impl SegmentEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageSplit {
-    Train,
-    Val,
-    Test,
-}
-
 #[derive(Clone, Default)]
 pub struct DatasetImages {
     pub train: Vec<ImageEntry>,
@@ -67,25 +60,47 @@ pub struct DatasetImages {
 }
 
 impl DatasetImages {
-    pub fn from_entries(entries: Vec<ImageEntry>) -> Self {
+    pub fn from_paths(images_root: &Path, paths: Vec<PathBuf>) -> Self {
         let mut train = Vec::new();
         let mut val = Vec::new();
         let mut test = Vec::new();
-        for entry in entries {
-            match entry.split {
-                ImageSplit::Train => train.push(entry),
-                ImageSplit::Val => val.push(entry),
-                ImageSplit::Test => test.push(entry),
+        for relative in paths {
+            let mut components = relative.components();
+            let Some(split_component) = components.next() else {
+                continue;
+            };
+            let split = split_component.as_os_str().to_string_lossy();
+            if split.is_empty() {
+                continue;
+            }
+            let remainder = components.as_path();
+            if remainder.as_os_str().is_empty() {
+                continue;
+            }
+            let entry_path = remainder.to_path_buf();
+            let full_path = images_root.join(&relative);
+            let has_labels = full_path.with_extension("txt").exists();
+            let entry = ImageEntry {
+                path: entry_path,
+                has_labels,
+            };
+            match split.as_ref() {
+                "train" => train.push(entry),
+                "val" => val.push(entry),
+                "test" => test.push(entry),
+                _ => {}
             }
         }
+        train.sort_by(|a, b| a.path.cmp(&b.path));
+        val.sort_by(|a, b| a.path.cmp(&b.path));
+        test.sort_by(|a, b| a.path.cmp(&b.path));
         Self { train, val, test }
     }
 }
 
 #[derive(Clone)]
 pub struct ImageEntry {
-    pub split: ImageSplit,
-    pub path: String,
+    pub path: PathBuf,
     pub has_labels: bool,
 }
 
@@ -185,8 +200,9 @@ impl Dataset {
     }
 
     pub fn refresh_image_lists(&mut self) {
-        let entries = watcher::gather_images(&self.root.join("images"));
-        self.images = DatasetImages::from_entries(entries);
+        let images_dir = self.root.join("images");
+        let entries = watcher::gather_images(&images_dir);
+        self.images = DatasetImages::from_paths(&images_dir, entries);
     }
 
     pub fn load_segments_for_image(&mut self, image_path: &Path) -> Result<usize, String> {
@@ -262,7 +278,7 @@ async fn worker_loop(
 
     let mut change_rx = change_rx.fuse();
     let mut shutdown_rx = shutdown_rx.fuse();
-    let (image_tx, mut image_rx) = mpsc::unbounded();
+    let (image_tx, mut image_rx) = mpsc::unbounded::<Vec<PathBuf>>();
     let mut watcher: Option<FsWatcher> = None;
 
     loop {
@@ -320,7 +336,7 @@ async fn worker_loop(
 
 fn configure_dataset_watcher(
     dataset: &Arc<RwLock<Option<Dataset>>>,
-    images_tx: mpsc::UnboundedSender<Vec<ImageEntry>>,
+    images_tx: mpsc::UnboundedSender<Vec<PathBuf>>,
 ) -> Option<FsWatcher> {
     let images_dir = {
         let guard = dataset.read().ok()?;
@@ -345,13 +361,14 @@ fn configure_dataset_watcher(
 
 fn update_dataset_images(
     dataset: &Arc<RwLock<Option<Dataset>>>,
-    entries: Vec<ImageEntry>,
+    entries: Vec<PathBuf>,
 ) -> Result<(), String> {
     let mut guard = dataset
         .write()
         .map_err(|_| "Dataset lock poisoned".to_owned())?;
     if let Some(ds) = guard.as_mut() {
-        ds.images = DatasetImages::from_entries(entries);
+        let images_dir = ds.root.join("images");
+        ds.images = DatasetImages::from_paths(&images_dir, entries);
     }
     Ok(())
 }

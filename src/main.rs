@@ -263,7 +263,7 @@ impl MyApp {
                         for entry in list {
                             let full_path =
                                 root_path.join("images").join(split_dir).join(&entry.path);
-                            ui.label(&entry.path);
+                            ui.label(entry.path.display().to_string());
                             ui.label(if entry.has_labels { "" } else { "(new)" });
                             if ui.small_button("Load").clicked() {
                                 self.load_image(ui.ctx(), &full_path);

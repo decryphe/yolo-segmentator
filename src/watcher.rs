@@ -1,4 +1,3 @@
-use crate::dataset::{ImageEntry, ImageSplit};
 use futures::channel::mpsc;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
@@ -10,11 +9,11 @@ pub struct DatasetWatcher {
     images_dir: PathBuf,
     watcher: Option<RecommendedWatcher>,
     event_rx: Option<mpsc::Receiver<notify::Result<Event>>>,
-    images_tx: mpsc::UnboundedSender<Vec<ImageEntry>>,
+    images_tx: mpsc::UnboundedSender<Vec<PathBuf>>,
 }
 
 impl DatasetWatcher {
-    pub fn new(images_dir: PathBuf, images_tx: mpsc::UnboundedSender<Vec<ImageEntry>>) -> Self {
+    pub fn new(images_dir: PathBuf, images_tx: mpsc::UnboundedSender<Vec<PathBuf>>) -> Self {
         Self {
             images_dir,
             watcher: None,
@@ -84,24 +83,16 @@ impl DatasetWatcher {
         Ok((watcher, rx))
     }
 
-    fn gather_images(&self) -> Vec<ImageEntry> {
+    fn gather_images(&self) -> Vec<PathBuf> {
         gather_images(self.images_dir())
     }
 }
 
-pub fn gather_images(images_dir: &Path) -> Vec<ImageEntry> {
-    let mut all = Vec::new();
-    for (split, subdir) in [
-        (ImageSplit::Train, "train"),
-        (ImageSplit::Val, "val"),
-        (ImageSplit::Test, "test"),
-    ] {
-        all.extend(collect_images(&images_dir.join(subdir), split));
-    }
-    all
+pub fn gather_images(images_dir: &Path) -> Vec<PathBuf> {
+    collect_images(images_dir)
 }
 
-fn collect_images(dir: &Path, split: ImageSplit) -> Vec<ImageEntry> {
+fn collect_images(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if !dir.exists() {
         return files;
@@ -116,21 +107,12 @@ fn collect_images(dir: &Path, split: ImageSplit) -> Vec<ImageEntry> {
             if entry_path.is_dir() {
                 queue.push_back(entry_path);
             } else if is_supported_image(&entry_path) {
-                let rel = entry_path
-                    .strip_prefix(dir)
-                    .unwrap_or(&entry_path)
-                    .display()
-                    .to_string();
-                let has_labels = entry_path.with_extension("txt").exists();
-                files.push(ImageEntry {
-                    split,
-                    path: rel,
-                    has_labels,
-                });
+                let rel = entry_path.strip_prefix(dir).unwrap_or(&entry_path);
+                files.push(rel.to_path_buf());
             }
         }
     }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.sort();
     files
 }
 
