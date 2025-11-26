@@ -7,9 +7,7 @@ mod watcher;
 use eframe::egui;
 use rfd::FileDialog;
 use std::{
-    fmt::Write as FmtWrite,
-    fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, RwLock},
 };
 
@@ -17,7 +15,7 @@ use crate::dataset::DirectoryWatcher;
 
 enum PendingAction {
     SaveOnly,
-    Navigate(PathBuf),
+    Navigate(dataset::ImageReference),
 }
 
 #[derive(Clone, Copy)]
@@ -47,7 +45,7 @@ struct MyApp {
     dataset: Arc<RwLock<Option<dataset::Dataset>>>,
     worker: DirectoryWatcher,
     status_message: Option<String>,
-    current_image: Option<(PathBuf, egui::TextureHandle)>,
+    current_image: Option<ActiveImage>,
     selected_segment_id: Option<usize>,
     data_dirty: bool,
     show_save_prompt: bool,
@@ -69,6 +67,11 @@ impl MyApp {
             pending_action: None,
         }
     }
+}
+
+struct ActiveImage {
+    reference: dataset::ImageReference,
+    texture: egui::TextureHandle,
 }
 
 impl eframe::App for MyApp {
@@ -188,7 +191,7 @@ impl MyApp {
             let guard = self.dataset.read().expect("dataset lock poisoned");
             guard
                 .as_ref()
-                .map(|dataset| (dataset.root.clone(), dataset.name(), dataset.images.clone()))
+                .map(|dataset| (dataset.root.clone(), dataset.name(), dataset.images_view()))
         };
         let Some((root_path, dataset_name, images)) = dataset_overview else {
             ui.label("(No dataset open)");
@@ -261,12 +264,10 @@ impl MyApp {
                     .num_columns(3)
                     .show(ui, |ui| {
                         for entry in list {
-                            let full_path =
-                                root_path.join("images").join(split_dir).join(&entry.path);
                             ui.label(entry.path.display().to_string());
                             ui.label(if entry.has_labels { "" } else { "(new)" });
                             if ui.small_button("Load").clicked() {
-                                self.load_image(ui.ctx(), &full_path);
+                                self.load_image(ui.ctx(), split_dir, &entry.path);
                             }
                             ui.end_row();
                         }
@@ -375,40 +376,52 @@ impl MyApp {
     }
 
     fn segment_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(active) = self.current_image.as_ref() else {
+            ui.label("Load an image to manage segments");
+            return;
+        };
         let mut dataset_guard = self.dataset.write().expect("dataset lock poisoned");
         let Some(dataset) = dataset_guard.as_mut() else {
             ui.label("Open a dataset to manage segments");
+            return;
+        };
+        let classes_snapshot = dataset.classes.clone();
+        let default_class = classes_snapshot.first().map_or(0, |c| c.id);
+        let Ok(loaded_image) =
+            dataset.ensure_image_loaded(&active.reference.split, &active.reference.relative_path)
+        else {
+            ui.label("Unable to load current image segments");
             return;
         };
 
         ui.horizontal(|ui| {
             ui.heading("Segments");
             if ui.button("New Segment").clicked() {
-                let default_class = dataset.classes.first().map_or(0, |c| c.id);
-                let next_id = dataset.next_segment_id();
-                dataset
+                let next_id = loaded_image.next_segment_id();
+                loaded_image
                     .segments
                     .push(dataset::SegmentEntry::new(next_id, default_class));
                 self.selected_segment_id = Some(next_id);
+                loaded_image.mark_dirty();
                 self.data_dirty = true;
                 self.status_message = Some(format!("Created segment #{next_id}"));
             }
         });
         ui.separator();
 
-        if dataset.segments.is_empty() {
+        if loaded_image.segments.is_empty() {
             ui.label("No segments created yet");
             return;
         }
 
-        let classes_snapshot = dataset.classes.clone();
         let mut segment_to_remove = None;
+        let mut dirty = false;
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("segment_grid")
                 .striped(true)
                 .num_columns(5)
                 .show(ui, |ui| {
-                    for (idx, segment) in dataset.segments.iter_mut().enumerate() {
+                    for (idx, segment) in loaded_image.segments.iter_mut().enumerate() {
                         ui.label(format!("#{:02}", segment.id));
                         let mut class_changed = false;
                         egui::ComboBox::from_id_salt(("segment_class", segment.id))
@@ -431,6 +444,7 @@ impl MyApp {
                                 }
                             });
                         if class_changed {
+                            dirty = true;
                             self.data_dirty = true;
                         }
                         ui.label(format!("Pts: {}", segment.polygon.len()));
@@ -445,12 +459,16 @@ impl MyApp {
                 });
         });
 
-        if let Some(idx) = segment_to_remove.filter(|&i| i < dataset.segments.len()) {
-            let removed = dataset.segments.remove(idx);
+        if let Some(idx) = segment_to_remove.filter(|&i| i < loaded_image.segments.len()) {
+            let removed = loaded_image.segments.remove(idx);
             if self.selected_segment_id == Some(removed.id) {
                 self.selected_segment_id = None;
             }
+            dirty = true;
             self.data_dirty = true;
+        }
+        if dirty {
+            loaded_image.mark_dirty();
         }
     }
 
@@ -461,25 +479,36 @@ impl MyApp {
         )
     }
 
+    fn current_segments_snapshot(&self) -> Vec<dataset::SegmentEntry> {
+        let Some(active) = &self.current_image else {
+            return Vec::new();
+        };
+        self.dataset
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().and_then(|dataset| {
+                    dataset
+                        .segments_snapshot(&active.reference.split, &active.reference.relative_path)
+                })
+            })
+            .unwrap_or_default()
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn center_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Image");
         ui.separator();
-        if let Some((path, texture)) = &self.current_image {
-            let segments_snapshot = self
-                .dataset
-                .read()
-                .ok()
-                .and_then(|guard| guard.as_ref().map(|d| d.segments.clone()))
-                .unwrap_or_default();
+        if let Some(active) = &self.current_image {
+            let segments_snapshot = self.current_segments_snapshot();
             if let Some(selected) = self.selected_segment_id {
                 ui.label(format!("Editing segment #{selected}"));
             } else {
                 ui.label("Select a segment to edit");
             }
-            ui.label(path.display().to_string());
-            let texture_id = texture.id();
-            let texture_size = texture.size_vec2();
+            ui.label(active.reference.full_path.display().to_string());
+            let texture_id = active.texture.id();
+            let texture_size = active.texture.size_vec2();
             let available = ui.available_size();
             let scale = (available.x / texture_size.x)
                 .min(available.y / texture_size.y)
@@ -571,48 +600,49 @@ impl MyApp {
             .unwrap_or(false)
     }
 
-    fn load_image(&mut self, ctx: &egui::Context, path: &Path) {
-        match image::open(path) {
-            Ok(image) => {
-                let rgba = image.to_rgba8();
-                let size = [rgba.width() as usize, rgba.height() as usize];
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                let texture = ctx.load_texture(
-                    format!("loaded_image_{}", path.display()),
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                );
-                self.current_image = Some((path.to_path_buf(), texture));
-                let segment_count = {
-                    let mut guard = self.dataset.write().expect("dataset lock poisoned");
-                    if let Some(dataset) = guard.as_mut() {
-                        match dataset.load_segments_for_image(path) {
-                            Ok(count) => Some(count),
-                            Err(err) => {
-                                self.status_message = Some(err);
-                                None
-                            }
-                        }
-                    } else {
-                        None
+    fn load_image(&mut self, ctx: &egui::Context, split: &str, relative_path: &Path) {
+        let (color_image, reference, segment_count, dirty) = {
+            let mut guard = self.dataset.write().expect("dataset lock poisoned");
+            let Some(dataset) = guard.as_mut() else {
+                self.status_message = Some("Open a dataset before loading images".to_owned());
+                return;
+            };
+            let (color_image, segment_count, dirty) = {
+                let loaded = match dataset.ensure_image_loaded(split, relative_path) {
+                    Ok(img) => img,
+                    Err(err) => {
+                        self.status_message = Some(err);
+                        return;
                     }
                 };
-                self.selected_segment_id = None;
-                self.data_dirty = false;
-                if let Some(count) = segment_count {
-                    self.status_message = Some(format!(
-                        "Loaded image {} with {} segment(s)",
-                        path.display(),
-                        count
-                    ));
-                } else {
-                    self.status_message = Some(format!("Loaded image {}", path.display()));
-                }
-            }
-            Err(err) => {
-                self.status_message =
-                    Some(format!("Failed to load image {}: {err}", path.display()));
-            }
+                let size = [
+                    loaded.pixels.width() as usize,
+                    loaded.pixels.height() as usize,
+                ];
+                let color_image =
+                    egui::ColorImage::from_rgba_unmultiplied(size, loaded.pixels.as_raw());
+                let segment_count = loaded.segments.len();
+                let dirty = loaded.dirty;
+                (color_image, segment_count, dirty)
+            };
+            let reference = dataset.image_reference(split, relative_path);
+            (color_image, reference, segment_count, dirty)
+        };
+
+        let texture = ctx.load_texture(
+            format!("loaded_image_{}", reference.full_path.display()),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.current_image = Some(ActiveImage { reference, texture });
+        self.selected_segment_id = None;
+        self.data_dirty = dirty;
+        if let Some(active) = &self.current_image {
+            self.status_message = Some(format!(
+                "Loaded image {} with {} segment(s)",
+                active.reference.full_path.display(),
+                segment_count
+            ));
         }
     }
 
@@ -625,21 +655,22 @@ impl MyApp {
             self.pending_action = Some(PendingAction::Navigate(target));
             self.show_save_prompt = true;
         } else {
-            self.load_image(ctx, &target);
+            self.load_image(ctx, &target.split, &target.relative_path);
         }
     }
 
-    fn next_image_path(&self, direction: NavDirection) -> Option<PathBuf> {
+    fn next_image_path(&self, direction: NavDirection) -> Option<dataset::ImageReference> {
         let guard = self.dataset.read().ok()?;
         let dataset = guard.as_ref()?;
-        let images = dataset.flattened_image_paths();
+        let images = dataset.flattened_image_refs();
         if images.is_empty() {
             return None;
         }
-        let current_idx = self
-            .current_image
-            .as_ref()
-            .and_then(|(path, _)| images.iter().position(|p| p == path));
+        let current_idx = self.current_image.as_ref().and_then(|active| {
+            images.iter().position(|entry| {
+                entry.matches(&active.reference.split, &active.reference.relative_path)
+            })
+        });
         let target_idx = match current_idx {
             Some(idx) => match direction {
                 NavDirection::Previous => (idx + images.len() - 1) % images.len(),
@@ -657,8 +688,8 @@ impl MyApp {
         if let Some(action) = self.pending_action.take() {
             match action {
                 PendingAction::SaveOnly => {}
-                PendingAction::Navigate(path) => {
-                    self.load_image(ctx, &path);
+                PendingAction::Navigate(reference) => {
+                    self.load_image(ctx, &reference.split, &reference.relative_path);
                 }
             }
         }
@@ -682,10 +713,25 @@ impl MyApp {
             self.status_message = Some("Select a segment before adding points".to_owned());
             return;
         };
+        let Some(active) = self.current_image.as_ref() else {
+            self.status_message = Some("Load an image before editing segments".to_owned());
+            return;
+        };
         let mut guard = self.dataset.write().expect("dataset lock poisoned");
         if let Some(dataset) = guard.as_mut() {
-            if let Some(segment) = dataset.segments.iter_mut().find(|seg| seg.id == segment_id) {
+            let Ok(loaded_image) = dataset
+                .ensure_image_loaded(&active.reference.split, &active.reference.relative_path)
+            else {
+                self.status_message = Some("Unable to load current image for editing".to_owned());
+                return;
+            };
+            if let Some(segment) = loaded_image
+                .segments
+                .iter_mut()
+                .find(|seg| seg.id == segment_id)
+            {
                 segment.polygon.push(dataset::SegmentPoint { x, y });
+                loaded_image.mark_dirty();
                 self.data_dirty = true;
                 self.status_message = Some(format!(
                     "Added point ({x:.3}, {y:.3}) to segment #{segment_id}"
@@ -698,59 +744,29 @@ impl MyApp {
     }
 
     fn save_current_image_segments(&mut self) -> Result<(), String> {
-        let current_image_path = self
+        let reference = self
             .current_image
             .as_ref()
-            .map(|(path, _)| path.clone())
+            .map(|img| img.reference.clone())
             .ok_or_else(|| "Load an image before saving segments".to_owned())?;
 
-        let segments = {
-            let guard = self
-                .dataset
-                .read()
-                .map_err(|_| "Dataset lock poisoned".to_owned())?;
+        let count = {
+            let mut guard = self.dataset.write().expect("dataset lock poisoned");
             let dataset = guard
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| "No dataset loaded".to_owned())?;
             dataset
                 .save_metadata()
                 .map_err(|err| format!("Failed to save dataset metadata: {err}"))?;
-            dataset.segments.clone()
+            dataset.save_loaded_image(&reference.split, &reference.relative_path)?
         };
 
-        let mut lines = Vec::new();
-        for segment in segments {
-            if segment.polygon.len() < 3 {
-                continue;
-            }
-            let mut line = segment.class_index.to_string();
-            for point in &segment.polygon {
-                let _ = write!(&mut line, " {:.6} {:.6}", point.x, point.y);
-            }
-            lines.push(line);
-        }
-
-        let txt_path = current_image_path.with_extension("txt");
-        if let Some(parent) = txt_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("Failed to create directory {}: {err}", parent.display()))?;
-        }
-        fs::write(&txt_path, lines.join("\n"))
-            .map_err(|err| format!("Failed to write {}: {err}", txt_path.display()))?;
-
-        {
-            let mut guard = self.dataset.write().expect("dataset lock poisoned");
-            if let Some(dataset) = guard.as_mut() {
-                dataset.refresh_image_lists();
-            }
-        }
-
+        self.data_dirty = false;
+        let txt_path = reference.full_path.with_extension("txt");
         self.status_message = Some(format!(
-            "Saved {} segment(s) to {}",
-            lines.len(),
+            "Saved {count} segment(s) to {}",
             txt_path.display()
         ));
-        self.data_dirty = false;
         Ok(())
     }
 }
