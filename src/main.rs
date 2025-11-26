@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::dataset::DirectoryWatcher;
+use crate::dataset::{DirectoryWatcher, ImagePurpose};
 
 enum PendingAction {
     SaveOnly,
@@ -250,11 +250,9 @@ impl MyApp {
 
         ui.separator();
         ui.heading("Images");
-        for (title, list, split_dir) in [
-            ("Training", images.train.as_slice(), "train"),
-            ("Validation", images.val.as_slice(), "val"),
-            ("Test", images.test.as_slice(), "test"),
-        ] {
+        for purpose in ImagePurpose::ALL {
+            let title = purpose.display_name();
+            let list = images.list(purpose);
             ui.label(egui::RichText::new(title).strong());
             if list.is_empty() {
                 ui.label("  (no images)");
@@ -267,7 +265,7 @@ impl MyApp {
                             ui.label(entry.path.display().to_string());
                             ui.label(if entry.has_labels { "" } else { "(new)" });
                             if ui.small_button("Load").clicked() {
-                                self.load_image(ui.ctx(), split_dir, &entry.path);
+                                self.load_image(ui.ctx(), purpose, &entry.path);
                             }
                             ui.end_row();
                         }
@@ -388,7 +386,7 @@ impl MyApp {
         let classes_snapshot = dataset.classes.clone();
         let default_class = classes_snapshot.first().map_or(0, |c| c.id);
         let Ok(loaded_image) =
-            dataset.ensure_image_loaded(&active.reference.split, &active.reference.relative_path)
+            dataset.ensure_image_loaded(active.reference.split, &active.reference.relative_path)
         else {
             ui.label("Unable to load current image segments");
             return;
@@ -489,7 +487,7 @@ impl MyApp {
             .and_then(|guard| {
                 guard.as_ref().and_then(|dataset| {
                     dataset
-                        .segments_snapshot(&active.reference.split, &active.reference.relative_path)
+                        .segments_snapshot(active.reference.split, &active.reference.relative_path)
                 })
             })
             .unwrap_or_default()
@@ -600,7 +598,7 @@ impl MyApp {
             .unwrap_or(false)
     }
 
-    fn load_image(&mut self, ctx: &egui::Context, split: &str, relative_path: &Path) {
+    fn load_image(&mut self, ctx: &egui::Context, split: ImagePurpose, relative_path: &Path) {
         let (color_image, reference, segment_count, dirty) = {
             let mut guard = self.dataset.write().expect("dataset lock poisoned");
             let Some(dataset) = guard.as_mut() else {
@@ -655,7 +653,7 @@ impl MyApp {
             self.pending_action = Some(PendingAction::Navigate(target));
             self.show_save_prompt = true;
         } else {
-            self.load_image(ctx, &target.split, &target.relative_path);
+            self.load_image(ctx, target.split, &target.relative_path);
         }
     }
 
@@ -668,7 +666,7 @@ impl MyApp {
         }
         let current_idx = self.current_image.as_ref().and_then(|active| {
             images.iter().position(|entry| {
-                entry.matches(&active.reference.split, &active.reference.relative_path)
+                entry.matches(active.reference.split, &active.reference.relative_path)
             })
         });
         let target_idx = match current_idx {
@@ -689,7 +687,7 @@ impl MyApp {
             match action {
                 PendingAction::SaveOnly => {}
                 PendingAction::Navigate(reference) => {
-                    self.load_image(ctx, &reference.split, &reference.relative_path);
+                    self.load_image(ctx, reference.split, &reference.relative_path);
                 }
             }
         }
@@ -720,7 +718,7 @@ impl MyApp {
         let mut guard = self.dataset.write().expect("dataset lock poisoned");
         if let Some(dataset) = guard.as_mut() {
             let Ok(loaded_image) = dataset
-                .ensure_image_loaded(&active.reference.split, &active.reference.relative_path)
+                .ensure_image_loaded(active.reference.split, &active.reference.relative_path)
             else {
                 self.status_message = Some("Unable to load current image for editing".to_owned());
                 return;
@@ -758,7 +756,7 @@ impl MyApp {
             dataset
                 .save_metadata()
                 .map_err(|err| format!("Failed to save dataset metadata: {err}"))?;
-            dataset.save_loaded_image(&reference.split, &reference.relative_path)?
+            dataset.save_loaded_image(reference.split, &reference.relative_path)?
         };
 
         self.data_dirty = false;

@@ -4,7 +4,8 @@ use image::RgbaImage;
 use serde_yaml_ng as serde_yaml;
 use std::{
     collections::BTreeMap,
-    fmt::Write as FmtWrite,
+    ffi::OsStr,
+    fmt::{self, Write as FmtWrite},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -52,6 +53,48 @@ impl SegmentEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ImagePurpose {
+    Train,
+    Val,
+    Test,
+}
+
+impl ImagePurpose {
+    pub const ALL: [ImagePurpose; 3] = [ImagePurpose::Train, ImagePurpose::Val, ImagePurpose::Test];
+
+    pub fn as_dir(self) -> &'static str {
+        match self {
+            Self::Train => "train",
+            Self::Val => "val",
+            Self::Test => "test",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Train => "Training",
+            Self::Val => "Validation",
+            Self::Test => "Test",
+        }
+    }
+
+    pub fn from_component(component: &OsStr) -> Option<Self> {
+        component.to_str().and_then(|value| match value {
+            "train" => Some(Self::Train),
+            "val" => Some(Self::Val),
+            "test" => Some(Self::Test),
+            _ => None,
+        })
+    }
+}
+
+impl fmt::Display for ImagePurpose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_dir())
+    }
+}
+
 #[derive(Default)]
 pub struct DatasetImages {
     pub train: Vec<ImageEntry>,
@@ -61,14 +104,14 @@ pub struct DatasetImages {
 
 impl DatasetImages {
     pub fn from_paths(images_root: &Path, paths: Vec<PathBuf>, existing: DatasetImages) -> Self {
-        let mut previous = BTreeMap::new();
+        let mut previous: BTreeMap<(ImagePurpose, PathBuf), ImageEntry> = BTreeMap::new();
         for (split, entries) in [
-            ("train", existing.train),
-            ("val", existing.val),
-            ("test", existing.test),
+            (ImagePurpose::Train, existing.train),
+            (ImagePurpose::Val, existing.val),
+            (ImagePurpose::Test, existing.test),
         ] {
             for entry in entries {
-                previous.insert((split.to_owned(), entry.path.clone()), entry);
+                previous.insert((split, entry.path.clone()), entry);
             }
         }
         let mut train = Vec::new();
@@ -79,10 +122,9 @@ impl DatasetImages {
             let Some(split_component) = components.next() else {
                 continue;
             };
-            let split = split_component.as_os_str().to_string_lossy();
-            if split.is_empty() {
+            let Some(split) = ImagePurpose::from_component(split_component.as_os_str()) else {
                 continue;
-            }
+            };
             let remainder = components.as_path();
             if remainder.as_os_str().is_empty() {
                 continue;
@@ -90,16 +132,15 @@ impl DatasetImages {
             let entry_path = remainder.to_path_buf();
             let full_path = images_root.join(&relative);
             let has_labels = full_path.with_extension("txt").exists();
-            let key = (split.to_string(), entry_path.clone());
+            let key = (split, entry_path.clone());
             let mut entry = previous
                 .remove(&key)
                 .unwrap_or_else(|| ImageEntry::new(entry_path, has_labels));
             entry.has_labels = has_labels;
-            match split.as_ref() {
-                "train" => train.push(entry),
-                "val" => val.push(entry),
-                "test" => test.push(entry),
-                _ => {}
+            match split {
+                ImagePurpose::Train => train.push(entry),
+                ImagePurpose::Val => val.push(entry),
+                ImagePurpose::Test => test.push(entry),
             }
         }
         train.sort_by(|a, b| a.path.cmp(&b.path));
@@ -116,22 +157,20 @@ impl DatasetImages {
         }
     }
 
-    fn entry_mut(&mut self, split: &str, relative: &Path) -> Option<&mut ImageEntry> {
+    fn entry_mut(&mut self, split: ImagePurpose, relative: &Path) -> Option<&mut ImageEntry> {
         let list = match split {
-            "train" => &mut self.train,
-            "val" => &mut self.val,
-            "test" => &mut self.test,
-            _ => return None,
+            ImagePurpose::Train => &mut self.train,
+            ImagePurpose::Val => &mut self.val,
+            ImagePurpose::Test => &mut self.test,
         };
         list.iter_mut().find(|entry| entry.path == relative)
     }
 
-    fn entry(&self, split: &str, relative: &Path) -> Option<&ImageEntry> {
+    fn entry(&self, split: ImagePurpose, relative: &Path) -> Option<&ImageEntry> {
         let list = match split {
-            "train" => &self.train,
-            "val" => &self.val,
-            "test" => &self.test,
-            _ => return None,
+            ImagePurpose::Train => &self.train,
+            ImagePurpose::Val => &self.val,
+            ImagePurpose::Test => &self.test,
         };
         list.iter().find(|entry| entry.path == relative)
     }
@@ -142,6 +181,16 @@ pub struct DatasetImagesView {
     pub train: Vec<ImageListEntry>,
     pub val: Vec<ImageListEntry>,
     pub test: Vec<ImageListEntry>,
+}
+
+impl DatasetImagesView {
+    pub fn list(&self, split: ImagePurpose) -> &[ImageListEntry] {
+        match split {
+            ImagePurpose::Train => &self.train,
+            ImagePurpose::Val => &self.val,
+            ImagePurpose::Test => &self.test,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -161,13 +210,13 @@ impl From<&ImageEntry> for ImageListEntry {
 
 #[derive(Clone)]
 pub struct ImageReference {
-    pub split: String,
+    pub split: ImagePurpose,
     pub relative_path: PathBuf,
     pub full_path: PathBuf,
 }
 
 impl ImageReference {
-    pub fn matches(&self, split: &str, relative: &Path) -> bool {
+    pub fn matches(&self, split: ImagePurpose, relative: &Path) -> bool {
         self.split == split && self.relative_path == relative
     }
 }
@@ -190,10 +239,13 @@ impl ImageEntry {
     fn ensure_loaded(
         &mut self,
         dataset_root: &Path,
-        split: &str,
+        split: ImagePurpose,
     ) -> Result<&mut LoadedImage, String> {
         if self.loaded.is_none() {
-            let full_path = dataset_root.join("images").join(split).join(&self.path);
+            let full_path = dataset_root
+                .join("images")
+                .join(split.as_dir())
+                .join(&self.path);
             self.loaded = Some(LoadedImage::load(full_path)?);
         }
         Ok(self.loaded.as_mut().expect("loaded image must exist"))
@@ -234,16 +286,14 @@ impl LoadedImage {
                 continue;
             }
             let mut parts = trimmed.split_whitespace();
-            let Some(Ok(class_index)) = parts.next().map(|u| u.parse::<usize>()) else {
+            let Some(class_index) = parts.next().and_then(|u| u.parse::<usize>().ok()) else {
                 continue;
             };
 
             let polygon: Vec<_> = parts
-                .into_iter()
                 .filter_map(|p| p.parse::<f32>().ok())
                 .collect::<Vec<_>>()
                 .chunks_exact(2)
-                .into_iter()
                 .filter_map(|p| match p {
                     [x, y] => Some(SegmentPoint { x: *x, y: *y }),
                     _ => None,
@@ -401,7 +451,7 @@ impl Dataset {
 
     pub fn ensure_image_loaded(
         &mut self,
-        split: &str,
+        split: ImagePurpose,
         relative: &Path,
     ) -> Result<&mut LoadedImage, String> {
         let entry = self
@@ -411,13 +461,21 @@ impl Dataset {
         entry.ensure_loaded(&self.root, split)
     }
 
-    pub fn segments_snapshot(&self, split: &str, relative: &Path) -> Option<Vec<SegmentEntry>> {
+    pub fn segments_snapshot(
+        &self,
+        split: ImagePurpose,
+        relative: &Path,
+    ) -> Option<Vec<SegmentEntry>> {
         self.images
             .entry(split, relative)
             .and_then(|entry| entry.loaded.as_ref().map(|img| img.segments.clone()))
     }
 
-    pub fn save_loaded_image(&mut self, split: &str, relative: &Path) -> Result<usize, String> {
+    pub fn save_loaded_image(
+        &mut self,
+        split: ImagePurpose,
+        relative: &Path,
+    ) -> Result<usize, String> {
         let entry = self
             .images
             .entry_mut(split, relative)
@@ -435,14 +493,18 @@ impl Dataset {
     pub fn flattened_image_refs(&self) -> Vec<ImageReference> {
         let mut result = Vec::new();
         for (split, entries) in [
-            ("train", &self.images.train),
-            ("val", &self.images.val),
-            ("test", &self.images.test),
+            (ImagePurpose::Train, &self.images.train),
+            (ImagePurpose::Val, &self.images.val),
+            (ImagePurpose::Test, &self.images.test),
         ] {
             for entry in entries {
-                let full_path = self.root.join("images").join(split).join(&entry.path);
+                let full_path = self
+                    .root
+                    .join("images")
+                    .join(split.as_dir())
+                    .join(&entry.path);
                 result.push(ImageReference {
-                    split: split.to_owned(),
+                    split,
                     relative_path: entry.path.clone(),
                     full_path,
                 });
@@ -451,11 +513,11 @@ impl Dataset {
         result
     }
 
-    pub fn image_reference(&self, split: &str, relative: &Path) -> ImageReference {
+    pub fn image_reference(&self, split: ImagePurpose, relative: &Path) -> ImageReference {
         ImageReference {
-            split: split.to_owned(),
+            split,
             relative_path: relative.to_path_buf(),
-            full_path: self.root.join("images").join(split).join(relative),
+            full_path: self.root.join("images").join(split.as_dir()).join(relative),
         }
     }
 }
