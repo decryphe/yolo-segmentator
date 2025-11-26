@@ -1,4 +1,5 @@
 use crate::watcher::{self, DatasetWatcher as FsWatcher};
+use eframe::egui;
 use futures::channel::{mpsc, oneshot};
 use image::RgbaImage;
 use serde_yaml_ng as serde_yaml;
@@ -350,6 +351,11 @@ impl LoadedImage {
             .max()
             .map_or(0, |max| max + 1)
     }
+
+    pub fn as_color_image(&self) -> egui::ColorImage {
+        let size = [self.pixels.width() as usize, self.pixels.height() as usize];
+        egui::ColorImage::from_rgba_unmultiplied(size, self.pixels.as_raw())
+    }
 }
 
 impl Dataset {
@@ -567,14 +573,12 @@ async fn worker_loop(
             }.fuse() => {
                 match event {
                     Some(Ok(event)) => {
-                        if watcher::matches_event(&event) {
-                            println!("Filesystem event: {event:?}");
-                            if let Some(err) = watcher
+                        if watcher::matches_event(&event)
+                            && let Some(err) = watcher
                                 .as_ref()
                                 .and_then(|active| active.send_image_snapshot().err())
-                            {
-                                eprintln!("Failed to refresh dataset images: {err}");
-                            }
+                        {
+                            eprintln!("Failed to refresh dataset images: {err}");
                         }
                     }
                     Some(Err(err)) => eprintln!("Filesystem watch error: {err}"),

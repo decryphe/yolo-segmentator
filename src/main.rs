@@ -2,6 +2,7 @@
 #![allow(rustdoc::missing_crate_level_docs)] // it's an example
 
 mod dataset;
+mod gui;
 mod watcher;
 
 use eframe::egui;
@@ -11,7 +12,10 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::dataset::{DirectoryWatcher, ImagePurpose};
+use crate::{
+    dataset::{DirectoryWatcher, ImagePurpose},
+    gui::{SavePromptResult, show_save_prompt},
+};
 
 enum PendingAction {
     SaveOnly,
@@ -124,33 +128,26 @@ impl eframe::App for MyApp {
             });
         }
 
-        if self.show_save_prompt {
-            egui::Window::new("Save Changes?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("Would you like to save the changes?");
-                    ui.horizontal(|ui| {
-                        if ui.button("Yes").clicked() {
-                            match self.save_current_image_segments() {
-                                Ok(()) => {
-                                    self.data_dirty = false;
-                                    self.show_save_prompt = false;
-                                    self.execute_pending_action(ctx);
-                                }
-                                Err(err) => {
-                                    self.status_message = Some(err);
-                                }
-                            }
-                        }
-                        if ui.button("No").clicked() {
-                            self.data_dirty = false;
-                            self.show_save_prompt = false;
-                            self.execute_pending_action(ctx);
-                        }
-                    });
-                });
+        if self.show_save_prompt
+            && let Some(choice) = show_save_prompt(ctx, "Save Changes?")
+        {
+            match choice {
+                SavePromptResult::Yes => match self.save_current_image_segments() {
+                    Ok(()) => {
+                        self.data_dirty = false;
+                        self.show_save_prompt = false;
+                        self.execute_pending_action(ctx);
+                    }
+                    Err(err) => {
+                        self.status_message = Some(err);
+                    }
+                },
+                SavePromptResult::No => {
+                    self.data_dirty = false;
+                    self.show_save_prompt = false;
+                    self.execute_pending_action(ctx);
+                }
+            }
         }
     }
 }
@@ -613,15 +610,7 @@ impl MyApp {
                         return;
                     }
                 };
-                let size = [
-                    loaded.pixels.width() as usize,
-                    loaded.pixels.height() as usize,
-                ];
-                let color_image =
-                    egui::ColorImage::from_rgba_unmultiplied(size, loaded.pixels.as_raw());
-                let segment_count = loaded.segments.len();
-                let dirty = loaded.dirty;
-                (color_image, segment_count, dirty)
+                (loaded.as_color_image(), loaded.segments.len(), loaded.dirty)
             };
             let reference = dataset.image_reference(split, relative_path);
             (color_image, reference, segment_count, dirty)
