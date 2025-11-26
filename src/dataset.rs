@@ -60,11 +60,7 @@ pub struct DatasetImages {
 }
 
 impl DatasetImages {
-    pub fn from_paths(
-        images_root: &Path,
-        paths: Vec<PathBuf>,
-        existing: DatasetImages,
-    ) -> Self {
+    pub fn from_paths(images_root: &Path, paths: Vec<PathBuf>, existing: DatasetImages) -> Self {
         let mut previous = BTreeMap::new();
         for (split, entries) in [
             ("train", existing.train),
@@ -202,7 +198,6 @@ impl ImageEntry {
         }
         Ok(self.loaded.as_mut().expect("loaded image must exist"))
     }
-
 }
 
 pub struct LoadedImage {
@@ -239,28 +234,22 @@ impl LoadedImage {
                 continue;
             }
             let mut parts = trimmed.split_whitespace();
-            let Some(class_part) = parts.next() else {
+            let Some(Ok(class_index)) = parts.next().map(|u| u.parse::<usize>()) else {
                 continue;
             };
-            let Ok(class_index) = class_part.parse::<usize>() else {
-                continue;
-            };
-            let mut coords = Vec::new();
-            for part in parts {
-                if let Ok(value) = part.parse::<f32>() {
-                    coords.push(value);
-                }
-            }
-            if coords.len() < 6 || coords.len() % 2 != 0 {
-                continue;
-            }
-            let mut polygon = Vec::new();
-            for chunk in coords.chunks(2) {
-                polygon.push(SegmentPoint {
-                    x: chunk[0],
-                    y: chunk[1],
-                });
-            }
+
+            let polygon: Vec<_> = parts
+                .into_iter()
+                .filter_map(|p| p.parse::<f32>().ok())
+                .collect::<Vec<_>>()
+                .chunks_exact(2)
+                .into_iter()
+                .filter_map(|p| match p {
+                    [x, y] => Some(SegmentPoint { x: *x, y: *y }),
+                    _ => None,
+                })
+                .collect();
+
             if polygon.len() < 3 {
                 continue;
             }
